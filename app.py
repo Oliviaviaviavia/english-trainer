@@ -172,7 +172,8 @@ def whisper_transcribe(path: str):
     global _whisper
     if _whisper is None:
         from faster_whisper import WhisperModel
-        _whisper = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8", cpu_threads=6)
+        _whisper = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8", cpu_threads=6,
+                                download_root=str(BASE / ".models"))
     # beam_size=1（贪心）+ 不依赖上文，比默认 beam5 快约 2.4 倍，质量对清晰人声几乎无损
     # word_timestamps=True：拿到词级时间戳，再按句末标点重新断句（Whisper 原始段是按音频切的，会跨句）
     segments, _ = _whisper.transcribe(path, language="en", beam_size=1,
@@ -563,6 +564,18 @@ def _ws_prepare():
 
 
 def word_break(text: str, answer: str, maxlen: int = 20):
+    # Keep numbers intact while segmenting surrounding English without spaces.
+    parts = re.split(r"(\d+(?:[,.]\d+)*)", text)
+    words = []
+    for part in parts:
+        if re.fullmatch(r"\d+(?:[,.]\d+)*", part):
+            words.append(part)
+        else:
+            words.extend(_word_break_letters(part, answer, maxlen))
+    return words
+
+
+def _word_break_letters(text: str, answer: str, maxlen: int = 20):
     from wordsegment import UNIGRAMS
     _ws_prepare()
     s = "".join(c for c in text.lower() if c.isalpha())   # 只留字母：忽略用户打的空格/标点（含手误的空格）
@@ -638,4 +651,4 @@ async def health():
 async def index():
     return FileResponse(BASE / "index.html")
 
-app.mount("/", StaticFiles(directory=str(BASE)), name="static")
+app.mount("/media", StaticFiles(directory=str(MEDIA)), name="media")

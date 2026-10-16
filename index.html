@@ -346,7 +346,10 @@ function pickVoice(lang){
 function browserSpeak(text,rate){
   speechSynthesis.cancel();
   const u=new SpeechSynthesisUtterance(text); u.lang=state.accent; u.rate=rate;
-  const v=pickVoice(state.accent); if(v)u.voice=v; speechSynthesis.speak(u);
+  const v=pickVoice(state.accent); if(v)u.voice=v;
+  u.onstart=()=>setPlayBtn(true);
+  u.onend=()=>{ setPlayBtn(false); scheduleLoop(); };
+  speechSynthesis.speak(u);
 }
 
 const player=new Audio();
@@ -387,11 +390,15 @@ player.addEventListener('ended',stopHighlight);
 player.addEventListener('timeupdate',()=>{
   if(player._stopAt!=null && player.currentTime>=player._stopAt){ player.pause(); player._stopAt=null; player._atEnd=true; scheduleLoop(); }
 });
-// 循环播放：一遍结束后留空隙再自动重播当前句（盲听记不住时不用反复点）
+// 循环播放：单句模式重播当前句，连读模式重播全文。
 function scheduleLoop(){
-  if(!state.loop || state.mode==='flow' || player._word || loopBlocked) return;   // 单词发音/录音中 → 不循环整句
+  if(!state.loop || player._word || loopBlocked) return;   // 单词发音/录音中 → 不循环整句
   if(loopTimer) clearTimeout(loopTimer);
-  loopTimer=setTimeout(()=>{ loopTimer=null; if(state.loop) playSentence(state.idx); }, 1300);
+  loopTimer=setTimeout(()=>{
+    loopTimer=null;
+    if(!state.loop || player._word || loopBlocked) return;
+    state.mode==='flow' ? playFlowAny() : playSentence(state.idx);
+  }, 1300);
 }
 
 // ---- 视频原声播放：按句子时间戳播放音频片段（不重新合成）----
@@ -511,7 +518,11 @@ function playFlowVideo(){
   player.play().catch(()=>{});
   hlSpans=spans; hlTimes=state.timing.map(s=>s.start); startTick();
 }
-function playFlowAny(){ return state.source==='video' ? playFlowVideo() : playFlow(); }
+function playFlowAny(){
+  loopBlocked=false;
+  if(loopTimer){ clearTimeout(loopTimer); loopTimer=null; }
+  return state.source==='video' ? playFlowVideo() : playFlow();
+}
 
 function render(){ updateProgress();
   if(state.mode==='flow'){ renderFlow(); if(state.source!=='video') prefetch(flowText); }
@@ -737,6 +748,10 @@ function wordDiff(t,u){   // 返回操作序列，避免错位导致的误判
   }
   return ops.reverse();
 }
+// Preserve numbers (including thousands separators and decimals) in scoring.
+const dictationTokens=s=>s.match(/[A-Za-z']+|\d+(?:[,.]\d+)*/g)||[];
+const normalizeDictationToken=w=>/^\d/.test(w)?w.replace(/,/g,''):w.toLowerCase();
+
 document.getElementById('blindCheck').onclick=async ()=>{
   const target=state.sentences[state.idx];
   const inp=document.getElementById('blindInput');
@@ -747,8 +762,8 @@ document.getElementById('blindCheck').onclick=async ()=>{
       body:JSON.stringify({text:inp.value, answer:target})});
     if(r.ok){ const d=await r.json(); if(d.words&&d.words.length){ typed=d.words.join(' '); inp.value=typed; } }
   }catch(e){ /* 后端不可用：用原输入兜底 */ }
-  const tTok=(target.match(/[A-Za-z']+/g)||[]), uTok=(typed.match(/[A-Za-z']+/g)||[]);
-  const tN=tTok.map(w=>w.toLowerCase()), uN=uTok.map(w=>w.toLowerCase());
+  const tTok=dictationTokens(target), uTok=dictationTokens(typed);
+  const tN=tTok.map(normalizeDictationToken), uN=uTok.map(normalizeDictationToken);
   const ops=wordDiff(tN,uN);
   // 拆成两行：ansParts=完整正确答案（标红=你没答对）；youParts=你打的（绿对/红错/删除线多写）
   let correct=0; const ansParts=[], youParts=[], errs=[];
@@ -811,11 +826,12 @@ document.addEventListener('keydown',e=>{
 
 // ---- 模式切换 ----
 function setMode(mode){
-  player.pause();
+  player.pause(); speechSynthesis.cancel();
   if(loopTimer){ clearTimeout(loopTimer); loopTimer=null; }
   const old=state.mode;
   if(old && old!=='flow' && state.idxBy[old]!=null) state.idxBy[old]=state.idx;  // 存旧模式进度
   state.mode=mode;
+  document.getElementById('loopBtn').title=mode==='flow' ? '循环播放全文，每遍之间间隔 1.3 秒' : '循环播放当前句，每遍之间留空隙给你写';
   if(mode!=='flow') state.idx=state.idxBy[mode]||0;                              // 取新模式自己的进度
   blindChecked=false; loopBlocked=false;
   document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active',t.dataset.mode===mode));
@@ -855,15 +871,19 @@ document.getElementById('loopBtn').onclick=()=>{
   document.getElementById('loopBtn').classList.toggle('on',state.loop);
   if(state.loop) loopBlocked=false;                       // 重新打开循环 → 解除录音封锁
   if(!state.loop && loopTimer){ clearTimeout(loopTimer); loopTimer=null; }
-  if(state.loop && state.mode!=='flow' && player.paused) playSentence(state.idx);
+  if(state.loop && player.paused && !speechSynthesis.speaking){
+    state.mode==='flow' ? playFlowAny() : playSentence(state.idx);
+  }
 };
 playBtn.onclick=()=>{
   // 正在放、或正处于循环间隙(等着自动重播) → 一律停下，并取消待执行的循环重播
-  if(!player.paused || loopTimer){
-    player.pause();
+  if(!player.paused || speechSynthesis.speaking || loopTimer){
+    loopBlocked=true;
+    player.pause(); speechSynthesis.cancel();
     if(loopTimer){ clearTimeout(loopTimer); loopTimer=null; }
     return;
   }
+  loopBlocked=false;
   if(state.mode!=='flow' && player.src && !player.ended && !player._atEnd && player.currentTime>0){ player.play(); return; } // 暂停处续播
   state.mode==='flow' ? playFlowAny() : playSentence(state.idx);                 // 从头播当前
 };
