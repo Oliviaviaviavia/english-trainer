@@ -6,6 +6,7 @@
 """
 import base64
 import glob
+import json
 import math
 import os
 import re
@@ -15,13 +16,14 @@ import sys
 import tempfile
 import uuid
 from pathlib import Path
+from threading import Lock
 from typing import Optional
 
 import edge_tts
 from fastapi import FastAPI, File, Form, UploadFile, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import download_range_func
@@ -168,11 +170,18 @@ def cues_to_sentences(cues, offset: float = 0.0):
 # 英文专用模型 base.en 比通用 base 又快又准；要再快设环境变量 WHISPER_MODEL=tiny.en
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base.en")
 _whisper = None
-def whisper_transcribe(path: str):
+_whisper_load_lock = Lock()
+
+def _get_whisper():
     global _whisper
-    if _whisper is None:
-        from faster_whisper import WhisperModel
-        _whisper = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8", cpu_threads=6)
+    with _whisper_load_lock:
+        if _whisper is None:
+            from faster_whisper import WhisperModel
+            _whisper = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8", cpu_threads=6)
+    return _whisper
+
+def whisper_transcribe(path: str):
+    _whisper = _get_whisper()
     # beam_size=1（贪心）+ 不依赖上文，比默认 beam5 快约 2.4 倍，质量对清晰人声几乎无损
     # word_timestamps=True：拿到词级时间戳，再按句末标点重新断句（Whisper 原始段是按音频切的，会跨句）
     segments, _ = _whisper.transcribe(path, language="en", beam_size=1,
@@ -199,6 +208,59 @@ def whisper_transcribe(path: str):
     segs, _ = _whisper.transcribe(path, language="en", beam_size=1, condition_on_previous_text=False)
     return [{"text": s.text.strip(), "start": round(s.start, 2), "end": round(s.end, 2)}
             for s in segs if s.text.strip()]
+
+class WordAlignmentReq(BaseModel):
+    audio_url: str = Field(max_length=200)
+    text: str = Field(min_length=1, max_length=1500)
+    start: float = Field(ge=0, allow_inf_nan=False)
+    end: float = Field(gt=0, allow_inf_nan=False)
+
+
+def _align_material_words(req: WordAlignmentReq):
+    """Locally align the known sentence with the original audio, without re-transcribing it."""
+    import numpy as np
+    from faster_whisper.audio import pad_or_trim
+    from faster_whisper.tokenizer import Tokenizer
+
+    match = re.fullmatch(r"/media/([^/\\]+)", req.audio_url)
+    if not match:
+        raise ValueError("只能对齐已导入的材料音频。")
+    path = (MEDIA / match.group(1)).resolve()
+    if path.parent != MEDIA.resolve() or not path.is_file():
+        raise ValueError("材料音频不存在，请重新导入视频。")
+    if not 0 < req.end - req.start <= 29:
+        raise ValueError("逐词对比支持29秒以内的句子，请先拆分长句。")
+    start = max(0, req.start - 0.12)
+    duration = req.end - start + 0.18
+    raw = subprocess.run(
+        ["ffmpeg", "-v", "error", "-ss", str(start), "-i", str(path), "-t", str(duration),
+         "-ar", "16000", "-ac", "1", "-f", "f32le", "pipe:1"],
+        capture_output=True, check=True, timeout=45,
+    ).stdout
+    audio = np.frombuffer(raw, dtype="<f4")
+    if len(audio) < 1600:
+        raise ValueError("这句没有足够的音频，无法截取单词。")
+    model = _get_whisper()
+    tokenizer = Tokenizer(model.hf_tokenizer, model.model.is_multilingual, task="transcribe", language="en")
+    features = model.feature_extractor(audio)
+    encoded = model.encode(pad_or_trim(features))
+    aligned = model.find_alignment(tokenizer, [tokenizer.encode(" " + req.text.strip())], encoded,
+                                   min(features.shape[-1], 3000))[0]
+    return [{"w": w["word"].strip(), "t": round(start + float(w["start"]), 4),
+             "d": round(float(w["end"] - w["start"]), 4)}
+            for w in aligned if w["word"].strip()]
+
+
+@app.post("/api/align-material")
+async def align_material(req: WordAlignmentReq):
+    try:
+        marks = await run_in_threadpool(_align_material_words, req)
+        return {"ok": True, "marks": marks}
+    except ValueError as ex:
+        return JSONResponse(status_code=400, content={"ok": False, "message": str(ex)})
+    except Exception:
+        return JSONResponse(status_code=500, content={"ok": False, "message": "材料单词对齐失败，请稍后重试或听整句。"})
+
 
 # 正常浏览器请求头：绕过 B 站等站点对 yt-dlp 默认 UA 的风控（412 Precondition Failed）
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -377,12 +439,18 @@ def _assess(wav_path: str, reference_text: str, language: str) -> dict:
                 "message": f"Azure 取消：{det.reason} {det.error_details or ''}".strip()}
 
     r = speechsdk.PronunciationAssessmentResult(result)
+    raw_words = (json.loads(result.json).get("NBest") or [{}])[0].get("Words", [])
     words = []
-    for w in (r.words or []):
+    for i, w in enumerate(r.words or []):
+        timing = raw_words[i] if i < len(raw_words) else {}
+        offset, duration = timing.get("Offset"), timing.get("Duration", 0)
+        has_audio = offset is not None and duration > 0 and w.error_type != "Omission"
         words.append({
             "word": w.word,
             "accuracy": round(w.accuracy_score, 1) if w.accuracy_score is not None else None,
             "error": w.error_type,   # None / Mispronunciation / Omission / Insertion
+            "start": round(offset / 1e7, 4) if has_audio else None,
+            "end": round((offset + duration) / 1e7, 4) if has_audio else None,
             "phonemes": [{"p": ph.phoneme, "score": round(ph.accuracy_score, 1)}
                          for ph in (w.phonemes or [])],
         })
@@ -463,10 +531,7 @@ async def set_azure_config(request: Request):
 # ---------- 基础识别（本地 Whisper，免费离线；跟读没配 Azure 时的兜底，不依赖 Google）----------
 def _transcribe_text(wav_path: str) -> str:
     """对一小段录音做本地转写，返回整段文字（用于跟读"基础"引擎的文字匹配）。"""
-    global _whisper
-    if _whisper is None:
-        from faster_whisper import WhisperModel
-        _whisper = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8", cpu_threads=6)
+    _whisper = _get_whisper()
     segs, _ = _whisper.transcribe(wav_path, language="en", beam_size=1, condition_on_previous_text=False)
     return " ".join(s.text.strip() for s in segs).strip()
 

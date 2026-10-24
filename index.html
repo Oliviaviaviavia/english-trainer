@@ -261,6 +261,7 @@
         </div>
         <div class="row">
           <button class="primary" id="rec"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0M12 17v4"/></svg>开始录音跟读</button>
+          <button class="ghost" id="recPlay" disabled title="录音结束后可回听">播放我的录音</button>
         </div>
         <div id="shadowResult"></div>
       </div>
@@ -344,6 +345,8 @@ function pickVoice(lang){
     || voices.find(v=>v.lang&&v.lang.startsWith(lang.slice(0,2))) || null;
 }
 function browserSpeak(text,rate){
+  stopWordComparison();
+  recordingPlayer.pause();
   speechSynthesis.cancel();
   const u=new SpeechSynthesisUtterance(text); u.lang=state.accent; u.rate=rate;
   const v=pickVoice(state.accent); if(v)u.voice=v; speechSynthesis.speak(u);
@@ -513,7 +516,7 @@ function playFlowVideo(){
 }
 function playFlowAny(){ return state.source==='video' ? playFlowVideo() : playFlow(); }
 
-function render(){ updateProgress();
+function render(){ clearShadowRecording(); updateProgress();
   if(state.mode==='flow'){ renderFlow(); if(state.source!=='video') prefetch(flowText); }
   else { renderSentence();
     if(state.source!=='video'){ prefetch(state.sentences[state.idx]); prefetch(state.sentences[state.idx+1]); } }
@@ -570,8 +573,138 @@ const normWords=s=>s.toLowerCase().replace(/[^a-z'\s]/g,' ').split(/\s+/).filter
 
 // ---- 跟读：录音 → Azure 发音评测 ----
 const scoreCls=v=>v==null?'mid':(v>=80?'good':v>=60?'mid':'low');
-let mediaRec=null, recChunks=[], recording=false;
+let mediaRec=null, recording=false, recordingGeneration=0;
 const recBtn=document.getElementById('rec');
+const recPlayBtn=document.getElementById('recPlay');
+const recordingPlayer=new Audio();
+let recordingUrl=null;
+let recordingBlob=null, recordingBuffer=null;
+let comparisonContext=null, comparisonSource=null, comparisonGeneration=0, materialBuffer=null;
+const materialAlignmentCache=new Map();
+function stopWordComparison(){
+  comparisonGeneration++;
+  if(comparisonSource){
+    const source=comparisonSource; comparisonSource=null;
+    try{ source.stop(); }catch{}
+    source.disconnect();
+  }
+}
+function wordComparisonContext(){
+  if(!comparisonContext) comparisonContext=new (window.AudioContext||window.webkitAudioContext)();
+  return comparisonContext;
+}
+async function comparisonAudio(url,mine=false){
+  const ctx=wordComparisonContext();
+  if(mine){
+    if(!recordingBlob) throw new Error('请先重新录一句。');
+    if(!recordingBuffer) recordingBuffer=recordingBlob.arrayBuffer().then(b=>ctx.decodeAudioData(b));
+    return recordingBuffer;
+  }
+  if(!materialBuffer || materialBuffer.url!==url){
+    const promise=fetch(url).then(r=>{ if(!r.ok) throw new Error('材料音频读取失败。'); return r.arrayBuffer(); })
+      .then(b=>ctx.decodeAudioData(b));
+    const entry={url,promise}; materialBuffer=entry;
+    promise.catch(()=>{ if(materialBuffer===entry) materialBuffer=null; });
+  }
+  return materialBuffer.promise;
+}
+function playWordClip(buffer,start,end){
+  const from=Math.max(0,start-0.025), to=Math.min(buffer.duration,end+0.03);
+  if(!Number.isFinite(from)||!Number.isFinite(to)||to<=from) throw new Error('这个单词没有可播放的音频片段。');
+  return new Promise(resolve=>{
+    const source=wordComparisonContext().createBufferSource();
+    comparisonSource=source; source.buffer=buffer; source.connect(comparisonContext.destination);
+    source.onended=()=>{ source.disconnect(); if(comparisonSource===source) comparisonSource=null; resolve(); };
+    source.start(0,from,to-from);
+  });
+}
+const comparisonWordKey=w=>w.toLowerCase().replace(/[^a-z0-9]/g,'');
+function materialWordRange(words,index,marks){
+  if(words[index].error==='Insertion') return null;
+  let offset=0, from=0, to=0, reference='';
+  words.forEach((w,i)=>{
+    if(w.error==='Insertion') return;
+    const key=comparisonWordKey(w.word);
+    if(i===index){ from=offset; to=offset+key.length; }
+    offset+=key.length; reference+=key;
+  });
+  if(from===to || marks.map(m=>comparisonWordKey(m.w)).join('')!==reference) return null;
+  let pos=0, first=null, last=null;
+  marks.forEach(m=>{
+    const length=comparisonWordKey(m.w).length;
+    if(length && pos<to && pos+length>from){ if(!first) first=m; last=m; }
+    pos+=length;
+  });
+  return first&&last ? {start:first.t,end:last.t+last.d} : null;
+}
+async function materialWordAudio(){
+  if(state.source!=='video') return ttsFetch(state.sentences[state.idx],1.0);
+  const seg=state.timing&&state.timing[state.idx];
+  if(!seg||!state.audioUrl) throw new Error('没有这句的材料原声，请重新导入视频。');
+  const payload={audio_url:state.audioUrl,text:state.sentences[state.idx],start:seg.start,end:seg.end};
+  const url=state.audioUrl, key=JSON.stringify(payload);
+  if(!materialAlignmentCache.has(key)){
+    if(materialAlignmentCache.size>=80) materialAlignmentCache.delete(materialAlignmentCache.keys().next().value);
+    const pending=fetch('/api/align-material',{method:'POST',headers:{'Content-Type':'application/json'},body:key})
+      .then(async r=>{ const d=await r.json(); if(!r.ok||!d.ok) throw new Error(d.message||'材料单词对齐失败。'); return {url,marks:d.marks}; });
+    materialAlignmentCache.set(key,pending);
+    pending.catch(()=>{ if(materialAlignmentCache.get(key)===pending) materialAlignmentCache.delete(key); });
+  }
+  return materialAlignmentCache.get(key);
+}
+async function compareWord(words,index,mode,status){
+  stopPlaybackForRec();
+  const generation=comparisonGeneration, word=words[index];
+  status.textContent='正在准备单词音频……';
+  try{
+    await wordComparisonContext().resume();
+    if(mode!=='mine'){
+      const reference=await materialWordAudio();
+      const range=materialWordRange(words,index,reference.marks||[]);
+      if(!range || range.end<=range.start) throw new Error('材料中未找到可靠的单词时间点，请听整句对照。');
+      const buffer=await comparisonAudio(reference.url);
+      if(generation!==comparisonGeneration) return;
+      status.textContent=state.source==='video'?'正在播放材料原声……':'正在播放标准发音……';
+      await playWordClip(buffer,range.start,range.end);
+    }
+    if(generation!==comparisonGeneration) return;
+    if(mode!=='material'){
+      if(word.start==null||word.end==null) throw new Error('这个单词没有录音片段（可能漏读），请重新录一句。');
+      const buffer=await comparisonAudio(null,true);
+      if(generation!==comparisonGeneration) return;
+      status.textContent='正在播放我的发音……';
+      await playWordClip(buffer,word.start,word.end);
+    }
+    if(generation===comparisonGeneration) status.textContent='播放完毕，可再次点击对比。';
+  }catch(e){ if(generation===comparisonGeneration) status.textContent=e.message||'播放失败，请重试。'; }
+}
+function updateRecordingPlayback(){
+  recPlayBtn.textContent=recordingPlayer.paused?'播放我的录音':'暂停我的录音';
+  recPlayBtn.setAttribute('aria-pressed',String(!recordingPlayer.paused));
+}
+recordingPlayer.addEventListener('play',updateRecordingPlayback);
+recordingPlayer.addEventListener('pause',updateRecordingPlayback);
+recordingPlayer.addEventListener('ended',updateRecordingPlayback);
+recordingPlayer.addEventListener('play',stopWordComparison);
+player.addEventListener('play',()=>{ recordingPlayer.pause(); stopWordComparison(); });
+function clearShadowRecording(){
+  stopWordComparison();
+  recordingGeneration++;
+  if(mediaRec && mediaRec.state!=='inactive') mediaRec.stop();
+  recording=false; setRecBtn(false);
+  recordingPlayer.pause();
+  recordingPlayer.removeAttribute('src'); recordingPlayer.load();
+  if(recordingUrl) URL.revokeObjectURL(recordingUrl);
+  recordingUrl=null; recordingBlob=null; recordingBuffer=null; recPlayBtn.disabled=true;
+  recPlayBtn.title='录音结束后可回听'; updateRecordingPlayback();
+}
+recPlayBtn.onclick=async()=>{
+  if(!recordingUrl || recording) return;
+  if(!recordingPlayer.paused){ recordingPlayer.pause(); return; }
+  stopPlaybackForRec();
+  try{ await recordingPlayer.play(); }
+  catch(e){ recPlayBtn.title='播放失败，请再点一次重试'; }
+};
 const REC_IDLE='<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0M12 17v4"/></svg>开始录音跟读';
 const REC_STOP='<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>停止并评分';
 function setRecBtn(rec){ recBtn.innerHTML=rec?REC_STOP:REC_IDLE; recBtn.classList.toggle('recording',rec); }
@@ -590,6 +723,8 @@ recBtn.onclick=()=>recToggle();
 
 // 开始录音前停掉一切播放：否则麦克风会把朗读声也录进去、毁掉发音评分
 function stopPlaybackForRec(){
+  stopWordComparison();
+  ++playGen; recordingPlayer.pause();                     // 取消待完成的原声请求，防止回听时叠音
   loopBlocked=true;                                       // 同步封锁：挡住授权等待期里漏网的 ended→scheduleLoop
   if(loopTimer){ clearTimeout(loopTimer); loopTimer=null; }
   stopHighlight(); player.pause(); speechSynthesis.cancel();
@@ -599,24 +734,39 @@ async function recToggle(){
   const box=document.getElementById('shadowResult');
   if(recording){ mediaRec.stop(); return; }                 // 再按一下 = 停止并评分/识别
   stopPlaybackForRec();
+  const generation=recordingGeneration;
+  recBtn.disabled=true;
   let stream;
   try{ stream=await navigator.mediaDevices.getUserMedia({audio:true}); }
   catch(e){ loopBlocked=false; box.innerHTML='<div class="hint">麦克风打不开：'+e.message+'。请用 http://localhost:8000 访问并允许麦克风。</div>'; return; }
-  recChunks=[]; mediaRec=new MediaRecorder(stream);
-  mediaRec.ondataavailable=e=>{ if(e.data.size) recChunks.push(e.data); };
+  finally{ recBtn.disabled=false; }
+  if(generation!==recordingGeneration){ stream.getTracks().forEach(t=>t.stop()); return; }
+  clearShadowRecording();
+  const takeGeneration=recordingGeneration;
+  const recChunks=[], recorder=new MediaRecorder(stream);
+  mediaRec=recorder;
+  recorder.ondataavailable=e=>{ if(e.data.size) recChunks.push(e.data); };
   const eng=assessEngine;                                    // 录音开始时锁定引擎，避免中途切换错乱
-  mediaRec.onstop=async()=>{
-    recording=false; setRecBtn(false); stream.getTracks().forEach(t=>t.stop());
-    const blob=new Blob(recChunks,{type:mediaRec.mimeType||'audio/webm'});
+  recorder.onstop=async()=>{
+    stream.getTracks().forEach(t=>t.stop());
+    if(takeGeneration!==recordingGeneration) return;
+    recording=false; setRecBtn(false);
+    const blob=new Blob(recChunks,{type:recorder.mimeType||'audio/webm'});
+    if(blob.size){
+      recordingBlob=blob;
+      recordingUrl=URL.createObjectURL(blob); recordingPlayer.src=recordingUrl;
+      recPlayBtn.disabled=false; recPlayBtn.title='回听本句刚才的录音';
+    }
     if(eng==='azure') await sendAssess(blob); else await sendTranscribe(blob);
   };
-  mediaRec.start(); recording=true; setRecBtn(true);
+  recorder.start(); recording=true; setRecBtn(true);
   box.innerHTML='<div class="muted">'+(eng==='azure'
     ? '录音中……读出这句话，读完按一下空格（或点“停止并评分”）。'
     : '录音中……读出这句话，读完按一下空格结束（本地识别，离线免费）。')+'</div>';
 }
 
 async function sendAssess(blob){
+  const generation=recordingGeneration;
   const box=document.getElementById('shadowResult');
   box.innerHTML='<div class="muted">评分中……（上传到 Azure 分析发音，约几秒）</div>';
   const fd=new FormData();
@@ -625,7 +775,8 @@ async function sendAssess(blob){
   fd.append('accent', state.accent);
   let res, data;
   try{ res=await fetch('/api/assess',{method:'POST',body:fd}); data=await res.json(); }
-  catch(e){ box.innerHTML='<div class="hint">请求失败：'+e.message+'</div>'; return; }
+  catch(e){ if(generation===recordingGeneration) box.innerHTML='<div class="hint">请求失败：'+e.message+'</div>'; return; }
+  if(generation!==recordingGeneration) return;
   if(res.status===503 && data.error==='not_configured'){
     switchToBrowser('未配置 Azure，已切到基础识别（免费无限）。点录音再说一遍。'); return;
   }
@@ -673,8 +824,7 @@ function renderAssess(data){
     if(w.error==='Omission'){ cls='omit'; }
     else if(w.error==='Insertion'){ cls='ins'; extra='+'; }
     else cls=scoreCls(w.accuracy);
-    const hasPh=(w.phonemes&&w.phonemes.length);
-    return `<span class="wchip ${cls}" data-i="${i}"${hasPh?'':' style="cursor:default"'}>${extra}${w.word}</span>`;
+    return `<button type="button" class="wchip ${cls}" data-i="${i}">${extra}${escapeHtml(w.word)}</button>`;
   }).join('');
 
   document.getElementById('shadowResult').innerHTML=
@@ -684,19 +834,26 @@ function renderAssess(data){
        ${cell('准确度',s.accuracy)}${cell('流利度',s.fluency)}${cell('完整度',s.completeness)}${cell('韵律',s.prosody)}
      </div>
      <div class="pill" style="margin-top:12px;">识别到：<strong>${data.recognized||'（没听清）'}</strong></div>
-     <div class="muted" style="margin-top:12px;">逐词得分（绿好/黄中/红差，删除线=漏读，斜体+=多读）·点词看音素：</div>
+     <div class="muted" style="margin-top:12px;">逐词得分（绿好/黄中/红差，删除线=漏读，斜体+=多读）·点词看音素、听对比：</div>
      <div class="words">${chips}</div>
      <div class="phbox" id="phbox"></div>`;
 
   // 点词展开音素
   const words=data.words||[];
   document.querySelectorAll('#shadowResult .wchip').forEach(c=>c.onclick=()=>{
-    const w=words[+c.dataset.i]; const ph=document.getElementById('phbox');
-    if(!w.phonemes||!w.phonemes.length){ ph.style.display='none'; return; }
+    stopWordComparison();
+    const index=+c.dataset.i, w=words[index], ph=document.getElementById('phbox');
     document.querySelectorAll('#shadowResult .wchip').forEach(x=>x.classList.remove('sel'));
     c.classList.add('sel'); ph.style.display='block';
-    ph.innerHTML=`<div class="pht">“${w.word}” 音素得分${w.accuracy!=null?'（整词 '+w.accuracy+'）':''}：</div>`
-      +`<div class="phs">${w.phonemes.map(p=>`<span class="ph ${scoreCls(p.score)}">${p.p} ${p.score}</span>`).join('')}</div>`;
+    const mine=recordingBlob && w.start!=null && w.end>w.start;
+    ph.innerHTML=`<div class="pht">“${escapeHtml(w.word)}”${w.accuracy!=null?' · 整词得分 '+w.accuracy:''}</div>`
+      +`<div class="wordCompare"><div class="row" style="margin:10px 0;">
+        <button data-compare="material" ${w.error==='Insertion'?'disabled':''}>${state.source==='video'?'听材料原声':'听标准发音'}</button>
+        <button data-compare="mine" ${mine?'':'disabled'}>听我的发音</button>
+        <button data-compare="both" ${mine&&w.error!=='Insertion'?'':'disabled'}>连续对比（${state.source==='video'?'材料':'标准'} → 我）</button>
+      </div><div class="muted" role="status" id="wordComparisonStatus">${w.error==='Omission'?'本词漏读，没有对应的录音片段。':w.error==='Insertion'?'本词为多读，材料中没有对应单词。':'单词边界为自动对齐；连读处可能带有少量相邻声音。'}</div></div>`
+      +`<div class="phs" style="margin-top:12px;">${(w.phonemes||[]).map(p=>`<span class="ph ${scoreCls(p.score)}">${escapeHtml(p.p)} ${p.score}</span>`).join('')}</div>`;
+    ph.querySelectorAll('[data-compare]').forEach(b=>b.onclick=()=>compareWord(words,index,b.dataset.compare,document.getElementById('wordComparisonStatus')));
   });
 }
 
@@ -805,6 +962,7 @@ document.addEventListener('keydown',e=>{
   if(!document.getElementById('trainer').offsetParent) return;          // 练习屏没显示就不管
   const tag=(e.target.tagName||'').toLowerCase();
   if(tag==='input'||tag==='textarea'||e.target.isContentEditable) return;  // 不抢打字
+  if(e.target===recPlayBtn || e.target.closest('.wordCompare') || e.target.classList.contains('wchip')) return;
   if(e.code==='Space'||e.key===' '){ e.preventDefault(); recBtn.click(); }  // 空格切换录音
   else if(e.key==='Enter'){ e.preventDefault(); go(1); }                     // Enter 下一句
 });
